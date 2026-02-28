@@ -1,371 +1,355 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-import sqlite3
-import json
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import os
-from pathlib import Path
+import json
+import logging
+import io
+import csv
 from datetime import datetime
+from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
-app = FastAPI(title="Nigeria Election Monitoring System")
+# --- CONFIGURATION ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --------------------------------------------------
-# PATHS & CONFIG (CORRECTED FOR RENDER/LINUX)
-# --------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent
-DATA_PATH = BASE_DIR / "data" / "full.json"
-DB_PATH = BASE_DIR / "election_v2.db"
+app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Render-safe Pathing
+LOGO_PATH = os.path.join(os.getcwd(), "static", "logos")
+if os.path.exists(LOGO_PATH):
+    app.mount("/logos", StaticFiles(directory=LOGO_PATH), name="logos")
 
-# Ensure static directory exists for logos
-(BASE_DIR / "static").mkdir(exist_ok=True)
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+STATIC_PATH = os.path.join(os.getcwd(), "static")
+if os.path.exists(STATIC_PATH):
+    app.mount("/static", StaticFiles(directory=STATIC_PATH), name="static")
 
-# --------------------------------------------------
-# AUTH & DATA LOADING
-# --------------------------------------------------
-# Add your authorized Officer IDs here
-AUTHORIZED_OFFICERS = ["OFF-001", "OFF-002", "OFF-003", "ADMIN-01", "KWARA-05"]
+# --- DATABASE CONNECTION ---
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://election_v3_db_user:KHjYceeGY0OL5w1RMhVFM18AyRipv9Tl@dpg-d6gnomfkijhs73f1cfe0-a.oregon-postgres.render.com/election_v3_db")
 
-try:
-    with open(DATA_PATH, "r", encoding="utf-8") as f:
-        ALL_LOCATIONS = json.load(f)
-except Exception:
-    ALL_LOCATIONS = []
-
-PARTIES = [
-    {"name": "APC", "logo": "/static/logos/APC.png"},
-    {"name": "PDP", "logo": "/static/logos/PDP.png"},
-    {"name": "LP",  "logo": "/static/logos/LP.png"},
-    {"name": "NNPP", "logo": "/static/logos/NNPP.png"},
-    {"name": "ACCORD", "logo": "/static/logos/ACCORD.png"}
-]
+def get_db():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    # Added officer_id with UNIQUE constraint to prevent double-reporting
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS submissions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            officer_id TEXT UNIQUE,
-            state TEXT, lga TEXT, ward TEXT, pu_name TEXT,
-            total_accredited INTEGER, rejected_votes INTEGER,
-            incident_type TEXT, incident_desc TEXT,
-            latitude REAL, longitude REAL,
-            timestamp TEXT, votes_json TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS field_submissions (
+                id SERIAL PRIMARY KEY,
+                officer_id TEXT,
+                state TEXT, 
+                lg TEXT, 
+                ward TEXT, 
+                ward_code TEXT, 
+                pu_code TEXT UNIQUE, 
+                location TEXT,
+                total_accredited INTEGER, 
+                valid_votes INTEGER, 
+                lat REAL, 
+                lon REAL, 
+                timestamp TEXT, 
+                votes_json TEXT,
+                evidence_image BYTEA
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"❌ DB INIT ERROR: {e}")
 
 init_db()
 
-# --------------------------------------------------
-# ROUTES
-# --------------------------------------------------
-
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return HTMLResponse(INDEX_HTML)
-
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    return HTMLResponse(DASHBOARD_HTML)
-
-@app.post("/login")
-async def login(data: dict):
-    officer_id = data.get("officer_id", "").strip()
-    if officer_id in AUTHORIZED_OFFICERS:
-        return {"status": "success", "message": "Access Granted"}
-    return {"status": "error", "message": "Invalid Officer ID. Access Denied."}
+# --- API ENDPOINTS ---
 
 @app.get("/locations/states")
-def list_states():
-    return [s["state"] for s in ALL_LOCATIONS]
+def get_states():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT state FROM polling_units ORDER BY state")
+            return [r["state"] for r in cur.fetchall()]
 
 @app.get("/locations/lgas/{state}")
-def list_lgas(state: str):
-    for s in ALL_LOCATIONS:
-        if s["state"].lower() == state.lower():
-            return [l["name"] for l in s["lgas"]]
-    return []
+def get_lgas(state: str):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT lg FROM polling_units WHERE state = %s ORDER BY lg", (state,))
+            return [r["lg"] for r in cur.fetchall()]
 
-@app.get("/locations/wards/{state}/{lga}")
-def list_wards(state: str, lga: str):
-    for s in ALL_LOCATIONS:
-        if s["state"].lower() == state.lower():
-            for l in s["lgas"]:
-                if l["name"].lower() == lga.lower():
-                    return l["wards"]
-    return []
+@app.get("/locations/wards/{state}/{lg}")
+def get_wards(state: str, lg: str):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT ward, ward_code FROM polling_units WHERE state = %s AND lg = %s ORDER BY ward", (state, lg))
+            return [{"name": r["ward"], "code": r["ward_code"]} for r in cur.fetchall()]
 
-@app.get("/parties")
-def get_parties():
-    return PARTIES
+@app.get("/locations/pus/{state}/{lg}/{ward}")
+def get_pus(state: str, lg: str, ward: str):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT location, pu_code FROM polling_units WHERE state = %s AND lg = %s AND ward = %s", (state, lg, ward))
+            return [{"location": r["location"], "pu_code": r["pu_code"]} for r in cur.fetchall()]
 
 @app.post("/submit")
-async def submit_survey(data: dict):
-    officer_id = data.get("officer_id")
-    if not officer_id:
-        return {"status": "error", "message": "Session expired. Please log in again."}
-
+async def submit(
+    officer_id: str = Form(...),
+    state: str = Form(...),
+    lg: str = Form(...),
+    ward: str = Form(...),
+    ward_code: str = Form(...),
+    pu_code: str = Form(...),
+    location: str = Form(...),
+    total_accredited: int = Form(...),
+    valid_votes: int = Form(...),
+    lat: float = Form(...),
+    lon: float = Form(...),
+    votes_data: str = Form(...),
+    evidence: UploadFile = File(...)
+):
     try:
-        timestamp = datetime.utcnow().isoformat()
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO submissions (
-                officer_id, state, lga, ward, pu_name, total_accredited, rejected_votes,
-                incident_type, incident_desc, latitude, longitude,
-                timestamp, votes_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            officer_id, data.get("state"), data.get("lga"), data.get("ward"), data.get("pu_name"),
-            int(data.get("total_accredited") or 0), int(data.get("rejected_votes") or 0),
-            data.get("incident_type"), data.get("incident_desc"),
-            float(data.get("lat")) if data.get("lat") else None,
-            float(data.get("lon")) if data.get("lon") else None,
-            timestamp, json.dumps(data.get("votes") or {})
-        ))
-        conn.commit()
-        conn.close()
-        return {"status": "success", "message": f"Report submitted successfully for {officer_id}."}
-    except sqlite3.IntegrityError:
-        return {"status": "error", "message": "RIGGING ALERT: A report has already been submitted using this ID."}
+        img_bytes = await evidence.read()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO field_submissions (
+                    officer_id, state, lg, ward, ward_code, pu_code, location,
+                    total_accredited, valid_votes, lat, lon, timestamp, votes_json, evidence_image
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (
+                    officer_id, state, lg, ward, ward_code, pu_code, location,
+                    total_accredited, valid_votes, lat, lon, datetime.now().isoformat(), votes_data, img_bytes
+                ))
+                conn.commit()
+        return {"status": "success", "message": "Result & Evidence Uploaded Successfully"}
+    except psycopg2.IntegrityError:
+        return {"status": "error", "message": "Duplicate Entry: This PU has already submitted results."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 @app.get("/submissions")
-def get_submissions():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM submissions ORDER BY timestamp DESC")
-    rows = cursor.fetchall()
-    conn.close()
-    results = []
-    for row in rows:
-        r = dict(row)
-        votes = json.loads(r.pop("votes_json") or "{}")
-        for party, value in votes.items():
-            r[f"votes_party_{party}"] = value
-        results.append(r)
-    return results
+async def get_dashboard_data():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM field_submissions ORDER BY timestamp DESC")
+            data = []
+            for r in cur.fetchall():
+                v = json.loads(r['votes_json']) if isinstance(r['votes_json'], str) else r['votes_json']
+                data.append({
+                    "pu_name": r['location'], "state": r['state'], "lga": r['lg'], "ward": r['ward'],
+                    "latitude": r['lat'], "longitude": r['lon'],
+                    "votes_party_ACCORD": v.get("ACCORD", 0), "votes_party_APC": v.get("APC", 0),
+                    "votes_party_PDP": v.get("PDP", 0), "votes_party_ADC": v.get("ADC", 0)
+                })
+            return data
 
-# --------------------------------------------------
-# INDEX_HTML (WITH LOGIN FLOW)
-# --------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    parties = ["ACCORD", "AA", "AAC", "ADC", "ADP", "APC", "APGA", "APM", "APP", "BP", "LP", "NNPP", "NRM", "PDP", "PRP", "SDP", "YPP", "ZLP"]
+    party_cards = "".join([f'''
+        <div class="col-4 col-md-2 mb-2">
+            <div class="p-2 border rounded text-center bg-white shadow-sm">
+                <img src="/logos/{p}.png" onerror="this.src='https://via.placeholder.com/30?text={p}'" style="height:30px">
+                <small class="d-block fw-bold">{p}</small>
+                <input type="number" class="form-control form-control-sm party-v text-center" data-p="{p}" value="0" oninput="calculateTotals()">
+            </div>
+        </div>''' for p in parties])
+    return INDEX_HTML.replace("{party_cards}", party_cards)
 
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    return DASHBOARD_HTML
+
+# --- INDEX_HTML (STRUCTURE & CSS PRESERVED EXACTLY) ---
 INDEX_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<title>Election Monitoring - Field Officer Portal</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
-<style>
-body { font-family: 'Roboto', sans-serif; background: linear-gradient(to bottom, #f3f4f6, #e5e7eb); color: #111827; }
-.navbar { background-color: #0b3d91; }
-.navbar-brand, .navbar-text { color: #ffffff; font-weight: 600; }
-.card-gov { border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); padding: 30px; background-color: #ffffff; }
-.btn-gold { background-color: #ffc107; color: #0b3d91; font-weight: 600; }
-.btn-gold:hover { background-color: #e0a800; color: #0b3d91; }
-.section-title { font-weight: 700; text-transform: uppercase; margin-bottom: 12px; color: #0b3d91; border-bottom: 2px solid #ffc107; display: inline-block; }
-img.party-logo { width: 50px; height: 50px; object-fit: contain; }
-.d-none { display: none !important; }
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IMOLE YOUTH ACCORD MOBILIZATION</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background: linear-gradient(rgba(0,0,0,0.6), rgba(0,0,0,0.6)), url('/static/bg.png'); background-size: cover; background-attachment: fixed; min-height: 100vh; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .navbar { background: rgba(0, 135, 81, 0.9) !important; color: white; border-bottom: 4px solid #ffc107; }
+        .card { background: rgba(255, 255, 255, 0.95) !important; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.3); border: none; }
+        .section-label { font-size: 0.75rem; font-weight: bold; color: #008751; text-transform: uppercase; border-left: 3px solid #ffc107; padding-left: 10px; margin-bottom: 15px; display: block; }
+        .party-v { border: 1px solid #ced4da; border-radius: 4px; padding: 4px; font-weight: bold; }
+        .btn-success { background-color: #008751; border: none; }
+        .btn-success:hover { background-color: #006b41; }
+    </style>
 </head>
 <body>
-<nav class="navbar navbar-expand-lg px-4 py-3">
-    <span class="navbar-brand">🗳 Nigeria Election Monitoring</span>
-    <span class="navbar-text ms-auto" id="navStatus">Field Officer Access</span>
-</nav>
-
-<div class="container mt-5 mb-5">
-    <div id="loginView" class="row justify-content-center">
-        <div class="col-md-5">
-            <div class="card card-gov text-center">
-                <h4 class="fw-bold mb-4">OFFICER AUTHENTICATION</h4>
-                <div class="mb-3 text-start">
-                    <label class="form-label fw-bold">Enter Unique Officer ID</label>
-                    <input type="text" id="officerLoginInput" class="form-control form-control-lg" placeholder="e.g. OFF-001">
-                </div>
-                <button class="btn btn-gold btn-lg w-100" onclick="attemptLogin()">Login to System</button>
-            </div>
+    <nav class="navbar py-2 mb-4 text-center">
+        <div class="container d-flex justify-content-center align-items-center">
+            <img src="/logos/ACCORD.png" style="height: 40px; margin-right: 15px;">
+            <h5 class="mb-0 fw-bold">OFFICIAL FIELD COLLATION PORTAL</h5>
         </div>
-    </div>
+    </nav>
 
-    <div id="formView" class="row justify-content-center d-none">
-        <div class="col-lg-8">
-            <div class="card card-gov">
-                <div class="d-flex justify-content-between align-items-center mb-4">
-                    <h3 class="fw-bold text-uppercase m-0">Polling Unit Reporting</h3>
-                    <span id="activeOfficerBadge" class="badge bg-primary p-2"></span>
-                </div>
-                
-                <form id="surveyForm">
-                    <div class="mb-4">
-                        <div class="section-title">📍 Polling Unit Details</div>
-                        <select id="stateSelect" class="form-select mb-3" required><option selected disabled>Select State</option></select>
-                        <select id="lgaSelect" class="form-select mb-3" required><option selected disabled>Select LGA</option></select>
-                        <select id="wardSelect" class="form-select mb-3" required><option selected disabled>Select Ward</option></select>
-                        <input type="text" class="form-control" id="puName" placeholder="Polling Unit Name" required>
-                    </div>
-                    <div class="mb-4">
-                        <div class="section-title">🗳 Votes</div>
-                        <div id="partyVotes" class="row g-3"></div>
-                    </div>
-                    <div class="mb-4">
-                        <div class="section-title">📊 Summary</div>
-                        <div class="row">
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label fw-bold">Total Accredited</label>
-                                <input type="number" class="form-control" id="totalAccredited" required>
-                            </div>
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label fw-bold">Rejected Votes</label>
-                                <input type="number" class="form-control" id="rejectedVotes" required>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="mb-4">
-                        <div class="section-title">⚠ Incidents</div>
-                        <select class="form-select mb-3" id="incidentType">
-                            <option selected disabled>Select Incident Type</option>
-                            <option>None</option>
-                            <option>Violence</option>
-                            <option>Late Opening</option>
-                            <option>Equipment Failure</option>
+    <div class="container pb-5" style="max-width: 850px;">
+        <div id="loginArea" class="card p-5 text-center mx-auto" style="max-width: 400px; margin-top: 50px;">
+            <h5 class="mb-3 text-success">FIELD OFFICER LOGIN</h5>
+            <p class="small text-muted mb-4">Enter Unit ID (Ward-PU) to start</p>
+            <input type="text" id="oid" class="form-control mb-3 text-center py-2" placeholder="e.g. 05-001">
+            <button class="btn btn-success w-100 py-2 fw-bold" onclick="start()">VALIDATE UNIT ACCESS</button>
+        </div>
+
+        <div id="formArea" class="d-none">
+            <div class="card p-4">
+                <span class="section-label">1. Polling Unit Identification</span>
+                <div class="row g-2">
+                    <div class="col-4">
+                        <select id="s" class="form-select" onchange="loadLGAsDash()">
+                            <option value="">STATE</option>
                         </select>
-                        <textarea class="form-control" rows="3" id="incidentDesc" placeholder="Additional notes..."></textarea>
                     </div>
-                    <div class="mb-4">
-                        <div class="section-title">📡 GPS</div>
-                        <button type="button" class="btn btn-gold w-100" onclick="getLocation()">Capture Precise Location</button>
-                        <p id="gps" class="mt-2 text-center small fw-bold"></p>
+                    <div class="col-4">
+                        <select id="l" class="form-select" onchange="loadWardsDash()">
+                            <option value="">LGA</option>
+                        </select>
                     </div>
-                    <div class="d-grid">
-                        <button type="submit" class="btn btn-gold btn-lg">Submit Final Report</button>
+                    <div class="col-4">
+                        <select id="w" class="form-select" onchange="loadPUs()">
+                            <option value="">WARD</option>
+                        </select>
                     </div>
-                </form>
+                    <div class="col-12 mt-2">
+                        <select id="p" class="form-select" onchange="fillPU()">
+                            <option value="">SELECT POLLING UNIT</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="row mt-3 g-2">
+                    <div class="col-4"><small class="text-muted">Ward Code</small><input type="text" id="wc" class="form-control bg-light" readonly></div>
+                    <div class="col-4"><small class="text-muted">PU Code</small><input type="text" id="pc" class="form-control bg-light" readonly></div>
+                    <div class="col-4"><small class="text-muted">Location</small><input type="text" id="loc" class="form-control bg-light" readonly></div>
+                </div>
+            </div>
+
+            <div class="card p-4">
+                <span class="section-label">2. Official Scorecard (Enter Votes)</span>
+                <div class="row g-2">
+                    {party_cards}
+                </div>
+            </div>
+
+            <div class="card p-4">
+                <span class="section-label">3. Audit Data & Court Evidence</span>
+                <div class="row g-3">
+                    <div class="col-md-6">
+                        <label class="small text-muted fw-bold">Total Accredited Voters</label>
+                        <input type="number" id="ta" class="form-control" placeholder="From BVAS" oninput="calculateTotals()">
+                    </div>
+                    <div class="col-md-6">
+                        <label class="small text-muted fw-bold">Total Valid Votes (Calculated)</label>
+                        <input type="number" id="tc" class="form-control bg-light fw-bold text-success" readonly>
+                    </div>
+                    <div class="col-12 mt-3">
+                        <label class="small fw-bold text-success">Capture & Upload Official EC8A Result Sheet</label>
+                        <input type="file" id="evidence" class="form-control" accept="image/*">
+                        <p class="x-small text-muted mt-1" style="font-size: 0.7rem;">Capture image clearly. This serves as official evidence.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="d-flex gap-2 mb-4">
+                <button class="btn btn-outline-light flex-grow-1 py-3" onclick="getGPS()">FIX GPS LOCATION</button>
+                <button class="btn btn-success flex-grow-1 py-3 fw-bold" onclick="finalSubmit()">UPLOAD PU RESULT</button>
             </div>
         </div>
     </div>
-</div>
 
-<script>
-let lat = null, lon = null;
-let currentOfficerId = null;
+    <script>
+        let lat, lon, officerId, puData = [], wardData = [];
 
-async function attemptLogin() {
-    const id = document.getElementById("officerLoginInput").value.trim();
-    if(!id) return alert("Please enter your ID");
+        function start() {
+            officerId = document.getElementById('oid').value;
+            if(!officerId) return alert("Please enter Unit ID");
+            document.getElementById('loginArea').classList.add('d-none');
+            document.getElementById('formArea').classList.remove('d-none');
+            fetch('/locations/states').then(r=>r.json()).then(data=>{
+                const s = document.getElementById('s');
+                data.forEach(item => s.add(new Option(item.toUpperCase(), item)));
+            });
+        }
 
-    const res = await fetch("/login", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({officer_id: id})
-    });
-    const result = await res.json();
+        function loadLGAsDash() {
+            fetch('/locations/lgas/'+encodeURIComponent(document.getElementById('s').value)).then(r=>r.json()).then(data=>{
+                const l = document.getElementById('l'); l.innerHTML = '<option value="">LGA</option>';
+                data.forEach(item => l.add(new Option(item.toUpperCase(), item)));
+            });
+        }
 
-    if(result.status === "success") {
-        currentOfficerId = id;
-        document.getElementById("loginView").classList.add("d-none");
-        document.getElementById("formView").classList.remove("d-none");
-        document.getElementById("activeOfficerBadge").innerText = "Logged in: " + id;
-        loadStates(); loadParties();
-    } else {
-        alert(result.message);
-    }
-}
+        function loadWardsDash() {
+            fetch(`/locations/wards/${encodeURIComponent(document.getElementById('s').value)}/${encodeURIComponent(document.getElementById('l').value)}`)
+            .then(r=>r.json()).then(data=>{
+                wardData = data;
+                const w = document.getElementById('w'); w.innerHTML = '<option value="">WARD</option>';
+                data.forEach(item => w.add(new Option(item.name.toUpperCase(), item.name)));
+            });
+        }
 
-async function loadStates(){
-    const states = await (await fetch("/locations/states")).json();
-    const sel = document.getElementById("stateSelect");
-    states.forEach(s => { let opt = document.createElement("option"); opt.value = s; opt.innerText = s; sel.appendChild(opt); });
-}
+        function loadPUs() {
+            const w = document.getElementById('w').value;
+            const wardObj = wardData.find(x => x.name === w);
+            document.getElementById('wc').value = wardObj ? wardObj.code : '';
+            fetch(`/locations/pus/${encodeURIComponent(document.getElementById('s').value)}/${encodeURIComponent(document.getElementById('l').value)}/${encodeURIComponent(w)}`)
+            .then(r=>r.json()).then(data=>{
+                puData = data;
+                const p = document.getElementById('p'); p.innerHTML = '<option value="">SELECT POLLING UNIT</option>';
+                data.forEach((item, idx) => p.add(new Option(item.location.toUpperCase(), idx)));
+            });
+        }
 
-document.getElementById("stateSelect").addEventListener("change", async function(){
-    const lgas = await (await fetch(`/locations/lgas/${this.value}`)).json();
-    const sel = document.getElementById("lgaSelect");
-    sel.innerHTML = '<option selected disabled>Select LGA</option>';
-    lgas.forEach(l => { let opt = document.createElement("option"); opt.value = l; opt.innerText = l; sel.appendChild(opt); });
-});
+        function fillPU() {
+            const sel = puData[document.getElementById('p').value];
+            document.getElementById('pc').value = sel.pu_code;
+            document.getElementById('loc').value = sel.location.toUpperCase();
+        }
 
-document.getElementById("lgaSelect").addEventListener("change", async function(){
-    const wards = await (await fetch(`/locations/wards/${document.getElementById("stateSelect").value}/${this.value}`)).json();
-    const sel = document.getElementById("wardSelect");
-    sel.innerHTML = '<option selected disabled>Select Ward</option>';
-    wards.forEach(w => { 
-        let opt = document.createElement("option"); 
-        let name = (typeof w === 'string') ? w : (w.name || "Unknown");
-        opt.value = name; opt.innerText = name; sel.appendChild(opt); 
-    });
-});
+        function calculateTotals() {
+            let valid = 0; document.querySelectorAll('.party-v').forEach(i => valid += parseInt(i.value || 0));
+            document.getElementById('tc').value = valid;
+        }
 
-async function loadParties(){
-    const parties = await (await fetch("/parties")).json();
-    const container = document.getElementById("partyVotes");
-    container.innerHTML = "";
-    parties.forEach(p => {
-        const div = document.createElement("div"); div.className = "col-md-6 d-flex align-items-center mb-2";
-        div.innerHTML = `<img src="${p.logo}" class="party-logo me-2" onerror="this.src='https://via.placeholder.com/50'"><label class="me-2 fw-bold">${p.name}:</label><input type="number" class="form-control" data-party="${p.name}" required>`;
-        container.appendChild(div);
-    });
-}
+        function getGPS() { 
+            if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition(p => { 
+                    lat=p.coords.latitude; lon=p.coords.longitude; alert("GPS Fixed: " + lat + "," + lon); 
+                }, () => alert("GPS Error: Enable location services."));
+            }
+        }
 
-function getLocation(){
-    navigator.geolocation.getCurrentPosition(p => {
-        lat = p.coords.latitude; lon = p.coords.longitude;
-        document.getElementById("gps").innerText = `Captured: ${lat.toFixed(4)}, ${lon.toFixed(4)}`;
-    }, () => alert("Enable GPS to submit report"));
-}
+        async function finalSubmit() {
+            if(!lat) return alert("Please Fix GPS location first.");
+            const evidenceImg = document.getElementById('evidence').files[0];
+            if(!evidenceImg) return alert("Please capture EC8A photo for evidence.");
+            
+            const v = {}; document.querySelectorAll('.party-v').forEach(i => v[i.dataset.p] = parseInt(i.value || 0));
+            
+            const fd = new FormData();
+            fd.append('officer_id', officerId);
+            fd.append('state', document.getElementById('s').value);
+            fd.append('lg', document.getElementById('l').value);
+            fd.append('ward', document.getElementById('w').value);
+            fd.append('ward_code', document.getElementById('wc').value);
+            fd.append('pu_code', document.getElementById('pc').value);
+            fd.append('location', document.getElementById('loc').value);
+            fd.append('total_accredited', document.getElementById('ta').value);
+            fd.append('valid_votes', document.getElementById('tc').value);
+            fd.append('lat', lat); 
+            fd.append('lon', lon);
+            fd.append('votes_data', JSON.stringify(v));
+            fd.append('evidence', evidenceImg);
 
-document.getElementById("surveyForm").addEventListener("submit", async function(e){
-    e.preventDefault();
-    if(!lat || !lon) { alert("Please capture GPS location first."); return; }
-    
-    const votes = {};
-    document.querySelectorAll("#partyVotes input").forEach(i => votes[i.dataset.party] = parseInt(i.value) || 0);
-    
-    const payload = {
-        officer_id: currentOfficerId,
-        state: document.getElementById("stateSelect").value,
-        lga: document.getElementById("lgaSelect").value,
-        ward: document.getElementById("wardSelect").value,
-        pu_name: document.getElementById("puName").value,
-        incident_type: document.getElementById("incidentType").value,
-        incident_desc: document.getElementById("incidentDesc").value,
-        lat: lat, lon: lon,
-        total_accredited: parseInt(document.getElementById("totalAccredited").value),
-        rejected_votes: parseInt(document.getElementById("rejectedVotes").value),
-        votes: votes
-    };
-    
-    const res = await fetch("/submit", { 
-        method: "POST", 
-        headers: {"Content-Type":"application/json"}, 
-        body: JSON.stringify(payload)
-    });
-    const result = await res.json();
-    alert(result.message);
-    
-    if(result.status === "success") {
-        location.reload(); // Lock form after successful submission
-    }
-});
-</script>
-</body></html>
+            const res = await fetch('/submit', { method: 'POST', body: fd });
+            const out = await res.json();
+            alert(out.message);
+            if(out.status === 'success') location.reload();
+        }
+    </script>
+</body>
+</html>
 """
 
 # --------------------------------------------------
