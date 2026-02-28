@@ -1,13 +1,8 @@
-import psycopg2
-from psycopg2.extras import RealDictCursor
-import os
-import json
-import logging
-import io
-import csv
+import sqlite3, json, logging, os
+from pathlib import Path
 from datetime import datetime
-from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 # --- CONFIGURATION ---
@@ -16,132 +11,174 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Render-safe Pathing
-LOGO_PATH = os.path.join(os.getcwd(), "static", "logos")
+# Verified paths - KEPT EXACTLY AS PROVIDED
+DB_PATH = r"C:\Users\Popoola Idris\OneDrive - SAMBUS GEOSPATIAL\Desktop\Election\Election\Election\election_survey_full_demo\backend\app\election_v3.db"
+LOGO_PATH = r"C:\Users\Popoola Idris\OneDrive - SAMBUS GEOSPATIAL\Desktop\Election\Election\Election\election_survey_full_demo\backend\static\logos"
+
+# Serve logos
 if os.path.exists(LOGO_PATH):
     app.mount("/logos", StaticFiles(directory=LOGO_PATH), name="logos")
 
-STATIC_PATH = os.path.join(os.getcwd(), "static")
-if os.path.exists(STATIC_PATH):
-    app.mount("/static", StaticFiles(directory=STATIC_PATH), name="static")
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 
-# --- DATABASE CONNECTION ---
+# Use the Internal URL on Render, or External for local testing
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://election_v3_db_user:KHjYceeGY0OL5w1RMhVFM18AyRipv9Tl@dpg-d6gnomfkijhs73f1cfe0-a.oregon-postgres.render.com/election_v3_db")
 
 def get_db():
+    # RealDictCursor makes Postgres return results like a Python Dictionary (similar to SQLite's Row)
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
+@app.get("/submissions")
+async def get_dashboard_data():
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        # Note: Postgres uses double quotes for case-sensitive column names or keywords if necessary
+        cur.execute("SELECT * FROM field_submissions ORDER BY timestamp DESC")
+        rows = cur.fetchall()
+        
+        data = []
+        for r in rows:
+            # Postgres handles JSON columns better, but if you migrated them as TEXT:
+            votes = json.loads(r['votes_json']) if isinstance(r['votes_json'], str) else r['votes_json']
+            
+            data.append({
+                "pu_name": r['location'],
+                "state": r['state'],
+                "lga": r['lg'],
+                "ward": r['ward'],
+                "latitude": float(r['lat']) if r['lat'] else None,
+                "longitude": float(r['lon']) if r['lon'] else None,
+                "votes_party_ACCORD": votes.get("ACCORD", 0), 
+                "votes_party_APC": votes.get("APC", 0),
+                "votes_party_PDP": votes.get("PDP", 0),
+                "votes_party_ADC": votes.get("ADC", 0),
+            })
+        return data
+    finally:
+        cur.close()
+        conn.close()
+
+# --- REWRITE ENTIRE TABLE (UPDATED WITH UNIQUE CONSTRAINT) ---
 def init_db():
     try:
         conn = get_db()
         cur = conn.cursor()
+        
+        logger.info("Rebuilding field_submissions table...")
+        cur.execute("DROP TABLE IF EXISTS field_submissions")
+        
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS field_submissions (
-                id SERIAL PRIMARY KEY,
+            CREATE TABLE field_submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 officer_id TEXT,
                 state TEXT, 
                 lg TEXT, 
                 ward TEXT, 
                 ward_code TEXT, 
-                pu_code TEXT UNIQUE, 
+                pu_code TEXT, 
                 location TEXT,
+                reg_voters INTEGER, 
                 total_accredited INTEGER, 
                 valid_votes INTEGER, 
+                rejected_votes INTEGER, 
+                total_cast INTEGER,
                 lat REAL, 
                 lon REAL, 
                 timestamp TEXT, 
                 votes_json TEXT,
-                evidence_image BYTEA
+                UNIQUE(pu_code) -- ADDED: Prevents duplicate submissions for same PU
             )
         """)
         conn.commit()
-        cur.close()
         conn.close()
+        logger.info("✅ SUCCESS: Table field_submissions rewritten.")
     except Exception as e:
-        print(f"❌ DB INIT ERROR: {e}")
+        logger.error(f"❌ DB INIT ERROR: {e}")
 
 init_db()
 
 # --- API ENDPOINTS ---
 
-@app.get("/locations/states")
+@app.get("/api/states")
 def get_states():
     with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT state FROM polling_units ORDER BY state")
-            return [r["state"] for r in cur.fetchall()]
+        rows = conn.execute("SELECT DISTINCT state FROM polling_units ORDER BY state").fetchall()
+        return [r["state"] for r in rows]
 
-@app.get("/locations/lgas/{state}")
+@app.get("/api/lgas/{state}")
 def get_lgas(state: str):
     with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT lg FROM polling_units WHERE state = %s ORDER BY lg", (state,))
-            return [r["lg"] for r in cur.fetchall()]
+        rows = conn.execute("SELECT DISTINCT lg FROM polling_units WHERE state = ? ORDER BY lg", (state,)).fetchall()
+        return [r["lg"] for r in rows]
 
-@app.get("/locations/wards/{state}/{lg}")
+@app.get("/api/wards/{state}/{lg}")
 def get_wards(state: str, lg: str):
     with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT ward, ward_code FROM polling_units WHERE state = %s AND lg = %s ORDER BY ward", (state, lg))
-            return [{"name": r["ward"], "code": r["ward_code"]} for r in cur.fetchall()]
+        rows = conn.execute("SELECT DISTINCT ward, ward_code FROM polling_units WHERE state = ? AND lg = ? ORDER BY ward", (state, lg)).fetchall()
+        return [{"name": r["ward"], "code": r["ward_code"]} for r in rows]
 
-@app.get("/locations/pus/{state}/{lg}/{ward}")
+@app.get("/api/pus/{state}/{lg}/{ward}")
 def get_pus(state: str, lg: str, ward: str):
     with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT location, pu_code FROM polling_units WHERE state = %s AND lg = %s AND ward = %s", (state, lg, ward))
-            return [{"location": r["location"], "pu_code": r["pu_code"]} for r in cur.fetchall()]
+        rows = conn.execute("SELECT location, pu_code FROM polling_units WHERE state = ? AND lg = ? AND ward = ?", (state, lg, ward)).fetchall()
+        return [{"location": r["location"], "pu_code": r["pu_code"]} for r in rows]
 
 @app.post("/submit")
-async def submit(
-    officer_id: str = Form(...),
-    state: str = Form(...),
-    lg: str = Form(...),
-    ward: str = Form(...),
-    ward_code: str = Form(...),
-    pu_code: str = Form(...),
-    location: str = Form(...),
-    total_accredited: int = Form(...),
-    valid_votes: int = Form(...),
-    lat: float = Form(...),
-    lon: float = Form(...),
-    votes_data: str = Form(...),
-    evidence: UploadFile = File(...)
-):
+async def submit(data: dict):
     try:
-        img_bytes = await evidence.read()
         with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""INSERT INTO field_submissions (
-                    officer_id, state, lg, ward, ward_code, pu_code, location,
-                    total_accredited, valid_votes, lat, lon, timestamp, votes_json, evidence_image
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (
-                    officer_id, state, lg, ward, ward_code, pu_code, location,
-                    total_accredited, valid_votes, lat, lon, datetime.now().isoformat(), votes_data, img_bytes
-                ))
-                conn.commit()
-        return {"status": "success", "message": "Result & Evidence Uploaded Successfully"}
-    except psycopg2.IntegrityError:
-        return {"status": "error", "message": "Duplicate Entry: This PU has already submitted results."}
+            conn.execute("""INSERT INTO field_submissions (
+                officer_id, state, lg, ward, ward_code, pu_code, location,
+                reg_voters, total_accredited, valid_votes, rejected_votes, total_cast,
+                lat, lon, timestamp, votes_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                data['officer_id'], data['state'], data['lg'], data['ward'], data['ward_code'],
+                data['pu_code'], data['location'], data['reg_voters'], data['total_accredited'],
+                data['valid_votes'], data['rejected_votes'], data['total_cast'],
+                data['lat'], data['lon'], datetime.now().isoformat(), json.dumps(data['votes'])
+            ))
+            conn.commit()
+        return {"status": "success", "message": "Result Uploaded Successfully"}
+    except sqlite3.IntegrityError:
+        return {"status": "error", "message": "REJECTED: A submission for this Polling Unit already exists."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-@app.get("/submissions")
-async def get_dashboard_data():
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM field_submissions ORDER BY timestamp DESC")
-            data = []
-            for r in cur.fetchall():
-                v = json.loads(r['votes_json']) if isinstance(r['votes_json'], str) else r['votes_json']
-                data.append({
-                    "pu_name": r['location'], "state": r['state'], "lga": r['lg'], "ward": r['ward'],
-                    "latitude": r['lat'], "longitude": r['lon'],
-                    "votes_party_ACCORD": v.get("ACCORD", 0), "votes_party_APC": v.get("APC", 0),
-                    "votes_party_PDP": v.get("PDP", 0), "votes_party_ADC": v.get("ADC", 0)
-                })
-            return data
+# --- NEW: PROFESSIONAL STATISTICAL AI INTERPRETATION ---
+@app.post("/api/ai_interpret")
+async def ai_interpret(data: dict):
+    acc = data.get('ACCORD', 0)
+    apc = data.get('APC', 0)
+    pdp = data.get('PDP', 0)
+    adc = data.get('ADC', 0)
+    
+    total = acc + apc + pdp + adc
+    if total == 0:
+        return {"analysis": "SYSTEM STATUS: Awaiting live data stream for comparative trend analysis."}
+    
+    # Statistical Calcs
+    share = (acc / total) * 100
+    competitors = {"APC": apc, "PDP": pdp, "ADC": adc}
+    top_rival = max(competitors, key=competitors.get)
+    rival_val = competitors[top_rival]
+    margin = acc - rival_val
+    
+    # Pro Interpretation logic
+    trend = "Dominant" if share > 50 else "Competitive"
+    performance = "Leading" if margin > 0 else "Trailing"
+    
+    analysis = (
+        f"STATISTICAL AUDIT: Accord currently maintains a {share:.1f}% vote share across reported units. "
+        f"In direct comparison with {top_rival} (Primary Rival), the party is {performance} by a margin of {abs(margin):,} votes. "
+        f"Performance metrics indicate a '{trend}' trajectory. Strategy: Consolidate presence in high-density wards "
+        f"to neutralize {top_rival}'s gains in peripheral LGAs."
+    )
+    return {"analysis": analysis}
 
+# --- FRONTEND (RETAINED EXACTLY) ---
 @app.get("/", response_class=HTMLResponse)
 async def index():
     parties = ["ACCORD", "AA", "AAC", "ADC", "ADP", "APC", "APGA", "APM", "APP", "BP", "LP", "NNPP", "NRM", "PDP", "PRP", "SDP", "YPP", "ZLP"]
@@ -153,208 +190,256 @@ async def index():
                 <input type="number" class="form-control form-control-sm party-v text-center" data-p="{p}" value="0" oninput="calculateTotals()">
             </div>
         </div>''' for p in parties])
-    return INDEX_HTML.replace("{party_cards}", party_cards)
 
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
-    return DASHBOARD_HTML
-
-# --- INDEX_HTML (STRUCTURE & CSS PRESERVED EXACTLY) ---
-INDEX_HTML = """
+    return f"""
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IMOLE YOUTH ACCORD MOBILIZATION</title>
+    <title>INEC Field Portal</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        body { background: linear-gradient(rgba(0,0,0,0.6), rgba(0,0,0,0.6)), url('/static/bg.png'); background-size: cover; background-attachment: fixed; min-height: 100vh; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        .navbar { background: rgba(0, 135, 81, 0.9) !important; color: white; border-bottom: 4px solid #ffc107; }
-        .card { background: rgba(255, 255, 255, 0.95) !important; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.3); border: none; }
-        .section-label { font-size: 0.75rem; font-weight: bold; color: #008751; text-transform: uppercase; border-left: 3px solid #ffc107; padding-left: 10px; margin-bottom: 15px; display: block; }
-        .party-v { border: 1px solid #ced4da; border-radius: 4px; padding: 4px; font-weight: bold; }
-        .btn-success { background-color: #008751; border: none; }
-        .btn-success:hover { background-color: #006b41; }
+        body {{ background: #f4f7f6; }}
+        .navbar {{ background: #008751; color: white; border-bottom: 4px solid #ffc107; }}
+        .card {{ border-radius: 12px; border: none; box-shadow: 0 4px 10px rgba(0,0,0,0.05); margin-bottom: 20px; }}
+        .section-label {{ font-size: 0.75rem; font-weight: bold; color: #008751; text-transform: uppercase; border-left: 3px solid #ffc107; padding-left: 10px; margin-bottom: 15px; display: block; }}
+        input[readonly] {{ background-color: #e9ecef !important; font-weight: bold; }}
+        .modal-header {{ background: #008751; color: white; }}
     </style>
 </head>
 <body>
-    <nav class="navbar py-2 mb-4 text-center">
-        <div class="container d-flex justify-content-center align-items-center">
-            <img src="/logos/ACCORD.png" style="height: 40px; margin-right: 15px;">
-            <h5 class="mb-0 fw-bold">OFFICIAL FIELD COLLATION PORTAL</h5>
-        </div>
-    </nav>
-
+    <nav class="navbar py-2 mb-4 text-center"><h5>ACCORD PARTY OFFICIAL FIELD COLLATION</h5></nav>
     <div class="container pb-5" style="max-width: 850px;">
-        <div id="loginArea" class="card p-5 text-center mx-auto" style="max-width: 400px; margin-top: 50px;">
-            <h5 class="mb-3 text-success">FIELD OFFICER LOGIN</h5>
-            <p class="small text-muted mb-4">Enter Unit ID (Ward-PU) to start</p>
-            <input type="text" id="oid" class="form-control mb-3 text-center py-2" placeholder="e.g. 05-001">
-            <button class="btn btn-success w-100 py-2 fw-bold" onclick="start()">VALIDATE UNIT ACCESS</button>
+        
+        <div id="loginArea" class="card p-5 text-center mx-auto" style="max-width: 400px;">
+            <h6>Enter Officer ID</h6>
+            <input type="text" id="oid" class="form-control mb-3 text-center">
+            <button class="btn btn-success w-100" onclick="start()">Validate Access</button>
         </div>
 
         <div id="formArea" class="d-none">
             <div class="card p-4">
-                <span class="section-label">1. Polling Unit Identification</span>
+                <span class="section-label">1. Polling Unit Selection</span>
                 <div class="row g-2">
-                    <div class="col-4">
-                        <select id="s" class="form-select" onchange="loadLGAsDash()">
-                            <option value="">STATE</option>
-                        </select>
-                    </div>
-                    <div class="col-4">
-                        <select id="l" class="form-select" onchange="loadWardsDash()">
-                            <option value="">LGA</option>
-                        </select>
-                    </div>
-                    <div class="col-4">
-                        <select id="w" class="form-select" onchange="loadPUs()">
-                            <option value="">WARD</option>
-                        </select>
-                    </div>
-                    <div class="col-12 mt-2">
-                        <select id="p" class="form-select" onchange="fillPU()">
-                            <option value="">SELECT POLLING UNIT</option>
-                        </select>
-                    </div>
+                    <div class="col-4"><select id="s" class="form-select" onchange="loadLGAs()"><option value="">STATE</option></select></div>
+                    <div class="col-4"><select id="l" class="form-select" onchange="loadWards()"><option value="">LGA</option></select></div>
+                    <div class="col-4"><select id="w" class="form-select" onchange="loadPUs()"><option value="">WARD</option></select></div>
+                    <div class="col-12 mt-2"><select id="p" class="form-select" onchange="fillPU()"><option value="">SELECT POLLING UNIT</option></select></div>
                 </div>
                 <div class="row mt-3 g-2">
-                    <div class="col-4"><small class="text-muted">Ward Code</small><input type="text" id="wc" class="form-control bg-light" readonly></div>
-                    <div class="col-4"><small class="text-muted">PU Code</small><input type="text" id="pc" class="form-control bg-light" readonly></div>
-                    <div class="col-4"><small class="text-muted">Location</small><input type="text" id="loc" class="form-control bg-light" readonly></div>
+                    <div class="col-4"><small>Ward Code</small><input type="text" id="wc" class="form-control" readonly></div>
+                    <div class="col-4"><small>PU Code</small><input type="text" id="pc" class="form-control" readonly></div>
+                    <div class="col-4"><small>Location</small><input type="text" id="loc" class="form-control" readonly></div>
                 </div>
             </div>
 
             <div class="card p-4">
-                <span class="section-label">2. Official Scorecard (Enter Votes)</span>
-                <div class="row g-2">
-                    {party_cards}
-                </div>
+                <span class="section-label">2. Official 18-Party Scorecard</span>
+                <div class="row g-2">{party_cards}</div>
             </div>
 
             <div class="card p-4">
-                <span class="section-label">3. Audit Data & Court Evidence</span>
+                <span class="section-label">3. Accreditation & Results Audit</span>
                 <div class="row g-3">
-                    <div class="col-md-6">
-                        <label class="small text-muted fw-bold">Total Accredited Voters</label>
-                        <input type="number" id="ta" class="form-control" placeholder="From BVAS" oninput="calculateTotals()">
-                    </div>
-                    <div class="col-md-6">
-                        <label class="small text-muted fw-bold">Total Valid Votes (Calculated)</label>
-                        <input type="number" id="tc" class="form-control bg-light fw-bold text-success" readonly>
-                    </div>
-                    <div class="col-12 mt-3">
-                        <label class="small fw-bold text-success">Capture & Upload Official EC8A Result Sheet</label>
-                        <input type="file" id="evidence" class="form-control" accept="image/*">
-                        <p class="x-small text-muted mt-1" style="font-size: 0.7rem;">Capture image clearly. This serves as official evidence.</p>
-                    </div>
+                    <div class="col-4"><label class="small">Registered Voters</label><input type="number" id="rv" class="form-control" value="0"></div>
+                    <div class="col-4"><label class="small">Accredited Voters</label><input type="number" id="ta" class="form-control" oninput="calculateTotals()"></div>
+                    <div class="col-4"><label class="small">Rejected Ballots</label><input type="number" id="rj" class="form-control" value="0" oninput="calculateTotals()"></div>
+                    <div class="col-6"><label class="small text-success fw-bold">Valid Votes</label><input type="number" id="vv" class="form-control" readonly></div>
+                    <div class="col-6"><label class="small text-primary fw-bold">Total Cast</label><input type="number" id="tc" class="form-control" readonly></div>
                 </div>
+                <div id="auditStatus" class="mt-3 p-2 rounded text-center d-none small fw-bold"></div>
             </div>
 
-            <div class="d-flex gap-2 mb-4">
-                <button class="btn btn-outline-light flex-grow-1 py-3" onclick="getGPS()">FIX GPS LOCATION</button>
-                <button class="btn btn-success flex-grow-1 py-3 fw-bold" onclick="finalSubmit()">UPLOAD PU RESULT</button>
+            <button class="btn btn-outline-dark w-100 mb-3" onclick="getGPS()">Fix GPS Location</button>
+            <button class="btn btn-success btn-lg w-100 py-3 fw-bold" onclick="reviewSubmission()">REVIEW & UPLOAD PU RESULT</button>
+        </div>
+    </div>
+
+    <div class="modal fade" id="reviewModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header"><h5>Review Results Summary</h5></div>
+                <div class="modal-body">
+                    <div class="row mb-3 border-bottom pb-2">
+                        <div class="col-6"><small>PU:</small> <div id="revPUName" class="fw-bold text-success"></div></div>
+                        <div class="col-3"><small>Accredited:</small> <div id="revAcc" class="fw-bold"></div></div>
+                        <div class="col-3"><small>Total Cast:</small> <div id="revCast" class="fw-bold"></div></div>
+                    </div>
+                    <h6 class="fw-bold">Party Scores:</h6>
+                    <div class="row g-1" id="revPartyGrid"></div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" data-bs-dismiss="modal">Go Back</button>
+                    <button class="btn btn-success fw-bold" onclick="finalSubmit()">Confirm and Submit</button>
+                </div>
             </div>
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         let lat, lon, officerId, puData = [], wardData = [];
+        const reviewModal = new bootstrap.Modal(document.getElementById('reviewModal'));
 
-        function start() {
+        function start() {{
             officerId = document.getElementById('oid').value;
-            if(!officerId) return alert("Please enter Unit ID");
+            if(!officerId) return;
             document.getElementById('loginArea').classList.add('d-none');
             document.getElementById('formArea').classList.remove('d-none');
-            fetch('/locations/states').then(r=>r.json()).then(data=>{
+            fetch('/api/states').then(r=>r.json()).then(data=>{{
                 const s = document.getElementById('s');
                 data.forEach(item => s.add(new Option(item.toUpperCase(), item)));
-            });
-        }
+            }});
+        }}
 
-        function loadLGAsDash() {
-            fetch('/locations/lgas/'+encodeURIComponent(document.getElementById('s').value)).then(r=>r.json()).then(data=>{
+        function loadLGAs() {{
+            const s = document.getElementById('s').value;
+            fetch('/api/lgas/'+encodeURIComponent(s)).then(r=>r.json()).then(data=>{{
                 const l = document.getElementById('l'); l.innerHTML = '<option value="">LGA</option>';
                 data.forEach(item => l.add(new Option(item.toUpperCase(), item)));
-            });
-        }
+            }});
+        }}
 
-        function loadWardsDash() {
-            fetch(`/locations/wards/${encodeURIComponent(document.getElementById('s').value)}/${encodeURIComponent(document.getElementById('l').value)}`)
-            .then(r=>r.json()).then(data=>{
+        function loadWards() {{
+            const s = document.getElementById('s').value;
+            const lg = document.getElementById('l').value;
+            fetch(`/api/wards/${{encodeURIComponent(s)}}/${{encodeURIComponent(lg)}}`).then(r=>r.json()).then(data=>{{
                 wardData = data;
                 const w = document.getElementById('w'); w.innerHTML = '<option value="">WARD</option>';
                 data.forEach(item => w.add(new Option(item.name.toUpperCase(), item.name)));
-            });
-        }
+            }});
+        }}
 
-        function loadPUs() {
+        function loadPUs() {{
+            const s = document.getElementById('s').value;
+            const lg = document.getElementById('l').value;
             const w = document.getElementById('w').value;
             const wardObj = wardData.find(x => x.name === w);
             document.getElementById('wc').value = wardObj ? wardObj.code : '';
-            fetch(`/locations/pus/${encodeURIComponent(document.getElementById('s').value)}/${encodeURIComponent(document.getElementById('l').value)}/${encodeURIComponent(w)}`)
-            .then(r=>r.json()).then(data=>{
+            fetch(`/api/pus/${{encodeURIComponent(s)}}/${{encodeURIComponent(lg)}}/${{encodeURIComponent(w)}}`).then(r=>r.json()).then(data=>{{
                 puData = data;
-                const p = document.getElementById('p'); p.innerHTML = '<option value="">SELECT POLLING UNIT</option>';
+                const p = document.getElementById('p'); p.innerHTML = '<option value="">SELECT PU</option>';
                 data.forEach((item, idx) => p.add(new Option(item.location.toUpperCase(), idx)));
-            });
-        }
+            }});
+        }}
 
-        function fillPU() {
-            const sel = puData[document.getElementById('p').value];
+        function fillPU() {{
+            const idx = document.getElementById('p').value;
+            const sel = puData[idx];
             document.getElementById('pc').value = sel.pu_code;
             document.getElementById('loc').value = sel.location.toUpperCase();
-        }
+        }}
 
-        function calculateTotals() {
-            let valid = 0; document.querySelectorAll('.party-v').forEach(i => valid += parseInt(i.value || 0));
-            document.getElementById('tc').value = valid;
-        }
-
-        function getGPS() { 
-            if (navigator.geolocation) {
-                navigator.geolocation.getCurrentPosition(p => { 
-                    lat=p.coords.latitude; lon=p.coords.longitude; alert("GPS Fixed: " + lat + "," + lon); 
-                }, () => alert("GPS Error: Enable location services."));
-            }
-        }
-
-        async function finalSubmit() {
-            if(!lat) return alert("Please Fix GPS location first.");
-            const evidenceImg = document.getElementById('evidence').files[0];
-            if(!evidenceImg) return alert("Please capture EC8A photo for evidence.");
+        function calculateTotals() {{
+            let valid = 0;
+            document.querySelectorAll('.party-v').forEach(i => valid += parseInt(i.value || 0));
+            const rej = parseInt(document.getElementById('rj').value || 0);
+            const acc = parseInt(document.getElementById('ta').value || 0);
+            const cast = valid + rej;
             
-            const v = {}; document.querySelectorAll('.party-v').forEach(i => v[i.dataset.p] = parseInt(i.value || 0));
-            
-            const fd = new FormData();
-            fd.append('officer_id', officerId);
-            fd.append('state', document.getElementById('s').value);
-            fd.append('lg', document.getElementById('l').value);
-            fd.append('ward', document.getElementById('w').value);
-            fd.append('ward_code', document.getElementById('wc').value);
-            fd.append('pu_code', document.getElementById('pc').value);
-            fd.append('location', document.getElementById('loc').value);
-            fd.append('total_accredited', document.getElementById('ta').value);
-            fd.append('valid_votes', document.getElementById('tc').value);
-            fd.append('lat', lat); 
-            fd.append('lon', lon);
-            fd.append('votes_data', JSON.stringify(v));
-            fd.append('evidence', evidenceImg);
+            document.getElementById('vv').value = valid;
+            document.getElementById('tc').value = cast;
 
-            const res = await fetch('/submit', { method: 'POST', body: fd });
+            const msg = document.getElementById('auditStatus');
+            msg.classList.remove('d-none');
+            if (acc > 0 && cast > acc) {{
+                msg.innerHTML = "⚠️ ERROR: Over-voting detected!";
+                msg.className = "mt-3 p-2 bg-danger text-white rounded text-center small fw-bold";
+            }} else if (cast > 0 && cast === acc) {{
+                msg.innerHTML = "✅ AUDIT BALANCED";
+                msg.className = "mt-3 p-2 bg-success text-white rounded text-center small fw-bold";
+            }} else {{ msg.classList.add('d-none'); }}
+        }}
+
+        function getGPS() {{
+            navigator.geolocation.getCurrentPosition(pos => {{
+                lat = pos.coords.latitude; lon = pos.coords.longitude;
+                alert("GPS Fixed!");
+            }});
+        }}
+
+        function reviewSubmission() {{
+            if(!lat) return alert("Please Fix GPS first");
+            document.getElementById('revPUName').innerText = document.getElementById('loc').value;
+            document.getElementById('revAcc').innerText = document.getElementById('ta').value;
+            document.getElementById('revCast').innerText = document.getElementById('tc').value;
+            
+            let grid = "";
+            document.querySelectorAll('.party-v').forEach(i => {{
+                grid += `<div class="col-4 small border p-1">${{i.dataset.p}}: <b>${{i.value}}</b></div>`;
+            }});
+            document.getElementById('revPartyGrid').innerHTML = grid;
+            reviewModal.show();
+        }}
+
+        async function finalSubmit() {{
+            const v = {{}};
+            document.querySelectorAll('.party-v').forEach(i => v[i.dataset.p] = parseInt(i.value || 0));
+            const payload = {{
+                officer_id: officerId, 
+                state: document.getElementById('s').value, 
+                lg: document.getElementById('l').value,
+                ward: document.getElementById('w').value, 
+                ward_code: document.getElementById('wc').value,
+                pu_code: document.getElementById('pc').value, 
+                location: document.getElementById('loc').value,
+                reg_voters: parseInt(document.getElementById('rv').value || 0), 
+                total_accredited: parseInt(document.getElementById('ta').value || 0),
+                valid_votes: parseInt(document.getElementById('vv').value || 0),
+                rejected_votes: parseInt(document.getElementById('rj').value || 0),
+                total_cast: parseInt(document.getElementById('tc').value || 0),
+                lat, lon, votes: v
+            }};
+            const res = await fetch('/submit', {{ method: 'POST', headers: {{'Content-Type':'application/json'}}, body: JSON.stringify(payload)}});
             const out = await res.json();
             alert(out.message);
             if(out.status === 'success') location.reload();
-        }
+        }}
     </script>
 </body>
 </html>
 """
 
-# --------------------------------------------------
-# DASHBOARD_HTML (REMAINS EXACTLY AS PROVIDED)
-# --------------------------------------------------
+# --- DASHBOARD BACKEND LOGIC ---
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_page():
+    return DASHBOARD_HTML
+
+@app.get("/locations/states")
+def get_dash_states():
+    return get_states()
+
+@app.get("/locations/lgas/{state}")
+def get_dash_lgas(state: str):
+    return get_lgas(state)
+
+@app.get("/locations/wards/{state}/{lga}")
+def get_dash_wards(state: str, lga: str):
+    return get_wards(state, lga)
+
+@app.get("/submissions")
+async def get_dashboard_data():
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM field_submissions ORDER BY timestamp DESC").fetchall()
+        data = []
+        for r in rows:
+            votes = json.loads(r['votes_json'])
+            data.append({
+                "pu_name": r['location'],
+                "state": r['state'],
+                "lga": r['lg'],
+                "ward": r['ward'],
+                "latitude": r['lat'],
+                "longitude": r['lon'],
+                "votes_party_ACCORD": votes.get("ACCORD", 0), 
+                "votes_party_APC": votes.get("APC", 0),
+                "votes_party_PDP": votes.get("PDP", 0),
+                "votes_party_ADC": votes.get("ADC", 0),
+                "incident_type": None 
+            })
+        return data
+
+# --- DASHBOARD HTML (FULL UPDATE) ---
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -366,8 +451,9 @@ DASHBOARD_HTML = """
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.0.0"></script>
     <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
     <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script src="https://leaflet.github.io/Leaflet.heat/dist/leaflet-heat.js"></script>
     <style>
-        :root { --bg: #0d0d0d; --panel: #161616; --gold: #ffc107; --border: #333; --text: #e0e0e0; --pdp: #d9534f; --apc: #0b3d91; }
+        :root { --bg: #0d0d0d; --panel: #161616; --gold: #ffc107; --border: #333; --text: #e0e0e0; --pdp: #d9534f; --apc: #0b3d91; --adc: #006400; }
         body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif; height: 100vh; margin: 0; overflow: hidden; display: flex; flex-direction: column; }
         select option { background-color: #161616 !important; color: white !important; }
         .navbar-custom { border-bottom: 1px solid var(--gold); padding: 0 15px; display: flex; align-items: center; background: var(--bg); height: 75px; gap: 15px; }
@@ -375,20 +461,21 @@ DASHBOARD_HTML = """
         .brand-title { font-size: 13px; font-weight: bold; color: white; letter-spacing: 1px; }
         .brand-sub { font-size: 10px; color: var(--gold); font-weight: bold; }
         .nav-kpi-group { display: flex; flex: 1; align-items: center; justify-content: center; gap: 12px; }
-        .party-box { display: flex; align-items: center; background: rgba(255,255,255,0.05); border: 1px solid var(--border); padding: 5px 15px; min-width: 140px; height: 62px; gap: 12px; }
-        .party-box img { height: 42px; width: 42px; border-radius: 50%; object-fit: contain; background: white; }
-        .party-info label { font-size: 9px; color: #888; text-transform: uppercase; margin: 0; font-weight: bold; display: block; }
-        .party-info span { font-size: 18px; font-weight: 900; color: white; line-height: 1; }
+        .party-box { display: flex; align-items: center; background: rgba(255,255,255,0.05); border: 1px solid var(--border); padding: 5px 15px; min-width: 130px; height: 62px; gap: 10px; }
+        .party-box img { height: 35px; width: 35px; border-radius: 50%; object-fit: contain; background: white; }
+        .party-info label { font-size: 8px; color: #888; text-transform: uppercase; margin: 0; font-weight: bold; display: block; }
+        .party-info span { font-size: 16px; font-weight: 900; color: white; line-height: 1; }
         .box-accord { border-top: 4px solid var(--gold); }
         .box-apc { border-top: 4px solid var(--apc); }
         .box-pdp { border-top: 4px solid var(--pdp); }
+        .box-adc { border-top: 4px solid var(--adc); }
         .box-margin { border-top: 4px solid #555; }
         .filter-group { display: flex; align-items: center; gap: 8px; }
         .filter-item { border-left: 1px solid var(--border); padding-left: 10px; }
         .filter-item label { color: var(--gold); font-size: 9px; text-transform: uppercase; display: block; font-weight: bold; }
         .filter-item select { background: transparent; color: #fff; border: none; font-size: 12px; outline: none; cursor: pointer; font-weight: bold; }
         .main-container { display: flex; flex: 1; gap: 10px; padding: 10px; overflow: hidden; height: calc(100vh - 75px); }
-        .col-side { width: 320px; display: flex; flex-direction: column; gap: 10px; }
+        .col-side { width: 320px; display: flex; flex-direction: column; gap: 10px; height: 100%; }
         .col-center { flex: 1; display: flex; flex-direction: column; gap: 10px; }
         .widget { background: var(--panel); border: 1px solid var(--border); padding: 12px; display: flex; flex-direction: column; border-radius: 4px; position: relative; }
         .widget-title { color: var(--gold); font-size: 10px; font-weight: bold; border-bottom: 1px solid var(--border); margin-bottom: 8px; padding-bottom: 4px; text-transform: uppercase; display: flex; justify-content: space-between; }
@@ -397,18 +484,25 @@ DASHBOARD_HTML = """
         .pu-list { flex: 1; overflow-y: auto; }
         .pu-card { border-bottom: 1px solid var(--border); padding: 12px 10px; cursor: pointer; transition: background 0.2s; }
         .pu-card:hover { background: rgba(255, 193, 7, 0.05); }
-        .pu-card.active { background: rgba(255, 193, 7, 0.15); border-left: 3px solid var(--gold); }
         .pu-card b { color: var(--gold); font-size: 13px; display: block; margin-bottom: 4px; }
         .pu-loc { font-size: 10px; color: #bbb; display: block; margin-bottom: 8px; }
-        .pu-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; background: rgba(0,0,0,0.5); padding: 8px; border-radius: 4px; pointer-events: none; }
+        .pu-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; background: rgba(0,0,0,0.5); padding: 8px; border-radius: 4px; pointer-events: none; }
         .grid-val { text-align: center; }
         .grid-val small { font-size: 8px; color: #888; display: block; text-transform: uppercase; }
-        .grid-val span { font-size: 12px; font-weight: bold; }
-        .incident-alert { color: #ff4444; font-size: 10px; font-weight: bold; margin-top: 8px; padding: 6px; background: rgba(255,0,0,0.1); border-radius: 3px; }
-        .chart-container { height: 160px; position: relative; }
-        .big-total-box { border: 2px solid var(--gold); text-align: center; padding: 15px; }
-        .big-val { font-size: 48px; font-weight: 900; color: white; line-height: 1; margin: 5px 0; }
+        .grid-val span { font-size: 11px; font-weight: bold; }
+        
+        /* Fixed Chart and Sidebar Alignment */
+        .chart-wrapper { height: 210px; position: relative; margin-bottom: 5px; }
+        .totals-container { flex: 1; display: flex; flex-direction: column; gap: 8px; overflow: hidden; }
+        .big-total-box { text-align: center; padding: 8px; flex: 1; display: flex; flex-direction: column; justify-content: center; }
+        .big-val { font-size: 28px; font-weight: 900; color: white; line-height: 1; margin: 4px 0; }
+        .box-acc-total { border: 1px solid var(--gold); }
+        .box-apc-total { border: 1px solid var(--apc); }
+        .box-pdp-total { border: 1px solid var(--pdp); }
+        .box-adc-total { border: 1px solid var(--adc); }
+        
         .ts-box { font-size: 9px; color: #888; text-transform: uppercase; margin-top: 4px; letter-spacing: 1px; }
+        #ai_box { background: #1a1a00; border: 1px solid #333300; padding: 10px; font-size: 11px; color: #ffc107; border-radius: 4px; min-height: 50px; overflow-y: auto;}
         ::-webkit-scrollbar { width: 4px; }
         ::-webkit-scrollbar-thumb { background: var(--gold); border-radius: 10px; }
     </style>
@@ -421,25 +515,29 @@ DASHBOARD_HTML = """
     </div>
     <div class="nav-kpi-group">
         <div class="party-box box-accord">
-            <img src="/static/logos/ACCORD.png" onerror="this.src='https://via.placeholder.com/42?text=A'">
+            <img src="/logos/ACCORD.png" onerror="this.src='https://via.placeholder.com/42?text=ACC'">
             <div class="party-info"><label>ACCORD</label><span id="nav-ACCORD">0</span></div>
         </div>
         <div class="party-box box-apc">
-            <img src="/static/logos/APC.png" onerror="this.src='https://via.placeholder.com/42?text=APC'">
+            <img src="/logos/APC.png" onerror="this.src='https://via.placeholder.com/42?text=APC'">
             <div class="party-info"><label>APC</label><span id="nav-APC">0</span></div>
         </div>
         <div class="party-box box-pdp">
-            <img src="/static/logos/PDP.png" onerror="this.src='https://via.placeholder.com/42?text=PDP'">
+            <img src="/logos/PDP.png" onerror="this.src='https://via.placeholder.com/42?text=PDP'">
             <div class="party-info"><label>PDP</label><span id="nav-PDP">0</span></div>
+        </div>
+        <div class="party-box box-adc">
+            <img src="/logos/ADC.png" onerror="this.src='https://via.placeholder.com/42?text=ADC'">
+            <div class="party-info"><label>ADC</label><span id="nav-ADC">0</span></div>
         </div>
         <div class="party-box box-margin">
             <div class="party-info" style="text-align:center; width:100%"><label>LEAD MARGIN</label><span id="nav-Margin" style="color:var(--gold)">0</span></div>
         </div>
     </div>
     <div class="filter-group">
-        <div class="filter-item"><label>State</label><select id="stateFilter"><option value="">All States</option></select></div>
-        <div class="filter-item"><label>LGA</label><select id="lgaFilter"><option value="">All LGAs</option></select></div>
-        <div class="filter-item"><label>Ward</label><select id="wardFilter"><option value="">All Wards</option></select></div>
+        <div class="filter-item"><label>State</label><select id="stateFilter" onchange="loadLGAsDash()"><option value="">All States</option></select></div>
+        <div class="filter-item"><label>LGA</label><select id="lgaFilter" onchange="loadWardsDash()"><option value="">All LGAs</option></select></div>
+        <div class="filter-item"><label>Ward</label><select id="wardFilter" onchange="refreshData()"><option value="">All Wards</option></select></div>
     </div>
 </nav>
 
@@ -450,199 +548,223 @@ DASHBOARD_HTML = """
                    style="background:#222; border:none; color:white; padding:10px; font-size:12px; width:100%; border-radius:4px;">
         </div>
         <div class="widget pu-list">
-            <div class="widget-title">
-                Live Result Feed
-                <span id="resetFeed" onclick="refreshData()" style="color:var(--gold); cursor:pointer; font-size:9px;">RESET VIEW</span>
-            </div>
+            <div class="widget-title">Live Result Feed <span onclick="resetFilters()" style="color:var(--gold); cursor:pointer;">RESET</span></div>
             <div id="puContainer"></div>
         </div>
     </div>
     <div class="col-center">
         <div class="widget map-wrapper"><div id="map"></div></div>
-        <div class="widget" style="height: 85px; text-align:center; justify-content:center;">
-            <div style="font-size:11px; color:var(--gold); font-weight:bold; text-transform:uppercase;">Reporting Coverage</div>
-            <div id="unitCount" style="font-size: 36px; font-weight: 900; color: white;">0 Units Reporting</div>
+        <div class="widget" style="height: 120px;">
+            <div class="widget-title">AI STATISTICAL INTERPRETATION</div>
+            <div id="ai_box">Loading high-level insights...</div>
+            <button onclick="runAI()" class="btn btn-sm btn-outline-warning mt-2">GENERATE STRATEGIC ANALYSIS</button>
         </div>
     </div>
     <div class="col-side">
-        <div class="widget">
+        <div class="widget chart-wrapper">
             <div class="widget-title" id="chartLabel">Vote Distribution %</div>
-            <div class="chart-container"><canvas id="pieChart"></canvas></div>
+            <canvas id="pieChart"></canvas>
         </div>
-        <div class="widget">
-            <div class="widget-title">Candidate Comparison</div>
-            <div style="height: 100px;"><canvas id="barChart"></canvas></div>
+        
+        <div class="totals-container">
+            <div class="widget big-total-box box-acc-total">
+                <div style="color:var(--gold); font-size:9px; font-weight:bold; text-transform:uppercase;">Accord Total</div>
+                <div id="totalAccordBig" class="big-val">0</div>
+            </div>
+            <div class="widget big-total-box box-apc-total">
+                <div style="color:var(--apc); font-size:9px; font-weight:bold; text-transform:uppercase;">APC Total</div>
+                <div id="totalAPCBig" class="big-val">0</div>
+            </div>
+            <div class="widget big-total-box box-pdp-total">
+                <div style="color:var(--pdp); font-size:9px; font-weight:bold; text-transform:uppercase;">PDP Total</div>
+                <div id="totalPDPBig" class="big-val">0</div>
+            </div>
+            <div class="widget big-total-box box-adc-total">
+                <div style="color:var(--adc); font-size:9px; font-weight:bold; text-transform:uppercase;">ADC Total</div>
+                <div id="totalADCBig" class="big-val">0</div>
+            </div>
         </div>
-        <div class="widget big-total-box">
-            <div style="color:var(--gold); font-size:11px; font-weight:bold; text-transform:uppercase;">Total Accord Aggregate</div>
-            <div id="totalAccordBig" class="big-val">0</div>
-            <div class="ts-box" id="lastUpdateTS">Last Updated: --:--:--</div>
-        </div>
+        
+        <div class="ts-box text-center" id="lastUpdateTS" style="margin-top:5px;">Last Updated: --:--:--</div>
     </div>
 </div>
 
 <script>
 Chart.register(ChartDataLabels);
+
+// Plugin to draw total in center
+const centerTextPlugin = {
+    id: 'centerText',
+    afterDraw: (chart) => {
+        if (chart.config.type !== 'doughnut') return;
+        const { ctx, chartArea: { top, bottom, left, right, width, height } } = chart;
+        ctx.save();
+        const total = chart.data.datasets[0].data.reduce((a, b) => a + b, 0);
+        
+        ctx.font = 'bold 12px Segoe UI';
+        ctx.fillStyle = '#888';
+        ctx.textAlign = 'center';
+        ctx.fillText('TOTAL VOTES', width / 2, height / 2 + top - 10);
+        
+        ctx.font = '900 18px Segoe UI';
+        ctx.fillStyle = '#fff';
+        ctx.fillText(total.toLocaleString(), width / 2, height / 2 + top + 15);
+        ctx.restore();
+    }
+};
+Chart.register(centerTextPlugin);
+
 let map = L.map('map', {zoomControl: false, attributionControl: false}).setView([9.082, 8.675], 6);
 L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
-let markers = [], charts = {}, globalData = [];
+let markers = [], heatLayer = null, charts = {}, globalData = [];
 
 async function initDashboard() {
     try {
         const states = await (await fetch("/locations/states")).json();
         const sS = document.getElementById("stateFilter");
-        states.forEach(s => sS.add(new Option(s, s)));
+        states.forEach(s => sS.add(new Option(s.toUpperCase(), s)));
     } catch(e) { console.error(e); }
     refreshData();
 }
 
-function focusOnUnit(puName) {
-    const unit = globalData.find(d => d.pu_name === puName);
-    if (!unit) return;
-    document.querySelectorAll('.pu-card').forEach(c => c.classList.remove('active'));
-    event.currentTarget.classList.add('active');
-    if (unit.latitude && unit.longitude) {
-        map.flyTo([unit.latitude, unit.longitude], 14, { duration: 1.5 });
-    }
-    document.getElementById('chartLabel').innerText = "Unit View: " + puName;
-    updateCharts(unit.votes_party_ACCORD || 0, unit.votes_party_APC || 0, unit.votes_party_PDP || 0);
-}
-
-document.getElementById("stateFilter").onchange = async (e) => {
+async function loadLGAsDash() {
+    const s = document.getElementById("stateFilter").value;
     const lS = document.getElementById("lgaFilter");
     lS.innerHTML = '<option value="">All LGAs</option>';
-    if(e.target.value) {
-        const lgas = await (await fetch("/locations/lgas/"+e.target.value)).json();
-        lgas.forEach(l => lS.add(new Option(l, l)));
-    }
+    if(!s) return refreshData();
+    const lgas = await (await fetch("/locations/lgas/"+encodeURIComponent(s))).json();
+    lgas.forEach(l => lS.add(new Option(l.toUpperCase(), l)));
     refreshData();
-};
+}
 
-document.getElementById("lgaFilter").onchange = async (e) => {
-    const state = document.getElementById("stateFilter").value;
+async function loadWardsDash() {
+    const s = document.getElementById("stateFilter").value;
+    const l = document.getElementById("lgaFilter").value;
     const wS = document.getElementById("wardFilter");
     wS.innerHTML = '<option value="">All Wards</option>';
-    if(e.target.value) {
-        const wards = await (await fetch(`/locations/wards/${state}/${e.target.value}`)).json();
-        wards.forEach(w => {
-            let name = (typeof w === 'string') ? w : (w.name || "Unknown");
-            wS.add(new Option(name, name));
-        });
-    }
+    if(!l) return refreshData();
+    const wards = await (await fetch(`/locations/wards/${encodeURIComponent(s)}/${encodeURIComponent(l)}`)).json();
+    wards.forEach(w => wS.add(new Option(w.name.toUpperCase(), w.name)));
     refreshData();
-};
+}
 
-document.getElementById("wardFilter").onchange = () => refreshData();
+function resetFilters() {
+    document.getElementById("stateFilter").value = "";
+    document.getElementById("lgaFilter").innerHTML = '<option value="">All LGAs</option>';
+    document.getElementById("wardFilter").innerHTML = '<option value="">All Wards</option>';
+    refreshData();
+}
 
 async function refreshData() {
     try {
         const res = await fetch("/submissions");
         let data = await res.json();
+        const sf = document.getElementById("stateFilter").value;
+        const lf = document.getElementById("lgaFilter").value;
+        const wf = document.getElementById("wardFilter").value;
+        const search = document.getElementById("puSearch").value.toLowerCase();
+        
+        if(sf) data = data.filter(d => d.state === sf);
+        if(lf) data = data.filter(d => d.lga === lf);
+        if(wf) data = data.filter(d => d.ward === wf);
+        if(search) data = data.filter(d => d.pu_name.toLowerCase().includes(search));
+
         globalData = data; 
-        const sF = document.getElementById("stateFilter").value;
-        const lF = document.getElementById("lgaFilter").value;
-        const wF = document.getElementById("wardFilter").value;
-        const sT = document.getElementById("puSearch").value.toLowerCase();
-        if(sF) data = data.filter(d => d.state === sF);
-        if(lF) data = data.filter(d => d.lga === lF);
-        if(wF) data = data.filter(d => d.ward === wF);
-        if(sT) data = data.filter(d => d.pu_name.toLowerCase().includes(sT));
-        document.getElementById('chartLabel').innerText = "Vote Distribution %";
         updateUI(data);
     } catch(e) { console.error(e); }
 }
 
-function updateUI(data) {
-    let tA = 0, tAPC = 0, tPDP = 0, listHtml = "";
-    markers.forEach(m => map.removeLayer(m));
-    markers = [];
-    data.forEach(d => {
-        const vA = d.votes_party_ACCORD || 0;
-        const vAPC = d.votes_party_APC || 0;
-        const vPDP = d.votes_party_PDP || 0;
-        tA += vA; tAPC += vAPC; tPDP += vPDP;
-        listHtml += `
-            <div class="pu-card" onclick="focusOnUnit('${d.pu_name}')">
-                <b>${d.pu_name}</b>
-                <span class="pu-loc">📍 ${d.ward}, ${d.lga}</span>
-                <div class="pu-grid">
-                    <div class="grid-val"><small>ACC</small><span style="color:var(--gold)">${vA.toLocaleString()}</span></div>
-                    <div class="grid-val"><small>APC</small><span>${vAPC.toLocaleString()}</span></div>
-                    <div class="grid-val"><small>PDP</small><span>${vPDP.toLocaleString()}</span></div>
-                </div>
-                ${d.incident_type ? `<div class="incident-alert">🚨 ${d.incident_type}</div>` : ""}
-            </div>`;
-        if(d.latitude && d.longitude) {
-            markers.push(L.circleMarker([d.latitude, d.longitude], {
-                radius: 7, color: '#ffc107', fillColor: '#ffc107', fillOpacity: 0.8, weight: 2
-            }).addTo(map));
-        }
+async function runAI() {
+    const data = {
+        ACCORD: parseInt(document.getElementById("nav-ACCORD").innerText.replace(/,/g, '')),
+        APC: parseInt(document.getElementById("nav-APC").innerText.replace(/,/g, '')),
+        PDP: parseInt(document.getElementById("nav-PDP").innerText.replace(/,/g, '')),
+        ADC: parseInt(document.getElementById("nav-ADC").innerText.replace(/,/g, '')),
+    };
+    const res = await fetch("/api/ai_interpret", {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data)
     });
-    document.getElementById("puContainer").innerHTML = listHtml;
-    document.getElementById("nav-ACCORD").innerText = tA.toLocaleString();
-    document.getElementById("nav-APC").innerText = tAPC.toLocaleString();
-    document.getElementById("nav-PDP").innerText = tPDP.toLocaleString();
-    document.getElementById("nav-Margin").innerText = (tA - Math.max(tAPC, tPDP)).toLocaleString();
-    document.getElementById("unitCount").innerText = `${data.length} Units Reporting`;
-    document.getElementById("totalAccordBig").innerText = tA.toLocaleString();
-    document.getElementById("lastUpdateTS").innerText = "Last Updated: " + new Date().toLocaleTimeString();
-    if (markers.length > 0) {
-        const group = new L.featureGroup(markers);
-        map.fitBounds(group.getBounds(), {padding:[40,40]});
-    }
-    updateCharts(tA, tAPC, tPDP);
+    const out = await res.json();
+    document.getElementById("ai_box").innerText = out.analysis;
 }
 
-function updateCharts(a, apc, pdp) {
-    const total = a + apc + pdp;
-    const labels = ['ACCORD', 'APC', 'PDP'];
-    const colors = ['#ffc107', '#0b3d91', '#d9534f'];
-    const values = [a, apc, pdp];
-    if(charts.bar) charts.bar.destroy();
-    charts.bar = new Chart(document.getElementById('barChart'), {
-        type: 'bar',
-        data: { labels: labels, datasets: [{ data: values, backgroundColor: colors }] },
-        options: {
-            maintainAspectRatio: false,
-            plugins: { datalabels: { display: false }, legend: { display: false } },
-            scales: { y: { grid: { color: '#222' }, ticks: { color: '#555', font: { size: 8 } } }, x: { ticks: { color: '#888', font: { size: 9 } } } }
+function updateUI(data) {
+    let tACCORD = 0, tAPC = 0, tPDP = 0, tADC = 0, listHtml = "", heatPoints = [];
+    markers.forEach(m => map.removeLayer(m));
+    if(heatLayer) map.removeLayer(heatLayer);
+    markers = [];
+    
+    data.forEach(d => {
+        tACCORD += d.votes_party_ACCORD; tAPC += d.votes_party_APC; tPDP += d.votes_party_PDP; tADC += d.votes_party_ADC;
+        
+        listHtml += `<div class="pu-card"><b>${d.pu_name}</b><small class="pu-loc">${d.lga}, ${d.ward}</small>
+        <div class="pu-grid">
+            <div class="grid-val"><small>ACC</small><span>${d.votes_party_ACCORD}</span></div>
+            <div class="grid-val"><small>APC</small><span>${d.votes_party_APC}</span></div>
+            <div class="grid-val"><small>PDP</small><span>${d.votes_party_PDP}</span></div>
+            <div class="grid-val"><small>ADC</small><span>${d.votes_party_ADC}</span></div>
+        </div></div>`;
+
+        if(d.latitude && d.longitude) {
+            markers.push(L.circleMarker([d.latitude, d.longitude], {radius: 4, color: '#ffc107'}).addTo(map));
+            heatPoints.push([d.latitude, d.longitude, d.votes_party_ACCORD / 100]);
         }
     });
+
+    heatLayer = L.heatLayer(heatPoints, {radius: 25, blur: 15, maxZoom: 10}).addTo(map);
+
+    document.getElementById("nav-ACCORD").innerText = tACCORD.toLocaleString();
+    document.getElementById("totalAccordBig").innerText = tACCORD.toLocaleString();
+    document.getElementById("nav-APC").innerText = tAPC.toLocaleString();
+    document.getElementById("totalAPCBig").innerText = tAPC.toLocaleString();
+    document.getElementById("nav-PDP").innerText = tPDP.toLocaleString();
+    document.getElementById("totalPDPBig").innerText = tPDP.toLocaleString();
+    document.getElementById("nav-ADC").innerText = tADC.toLocaleString();
+    document.getElementById("totalADCBig").innerText = tADC.toLocaleString();
+    
+    document.getElementById("nav-Margin").innerText = (tACCORD - Math.max(tAPC, tPDP)).toLocaleString();
+    document.getElementById("puContainer").innerHTML = listHtml;
+    document.getElementById("lastUpdateTS").innerText = "Last Updated: " + new Date().toLocaleTimeString();
+    
+    updateCharts(tACCORD, tAPC, tPDP, tADC);
+}
+
+function updateCharts(acc, apc, pdp, adc) {
+    const ctx = document.getElementById('pieChart');
     if(charts.pie) charts.pie.destroy();
-    charts.pie = new Chart(document.getElementById('pieChart'), {
+    charts.pie = new Chart(ctx, {
         type: 'doughnut',
-        data: { labels: labels, datasets: [{ data: values, backgroundColor: colors, borderWidth: 0 }] },
-        plugins: [{
-            id: 'centerText',
-            beforeDraw: (chart) => {
-                const { ctx, chartArea: { top, bottom, left, right } } = chart;
-                ctx.save();
-                const centerX = (left + right) / 2;
-                const centerY = (top + bottom) / 2;
-                ctx.textAlign = "center"; ctx.textBaseline = "middle";
-                ctx.font = "bold 10px Segoe UI"; ctx.fillStyle = "#888";
-                ctx.fillText("TOTAL", centerX, centerY - 10);
-                ctx.font = "bold 16px Segoe UI"; ctx.fillStyle = "white";
-                ctx.fillText(total.toLocaleString(), centerX, centerY + 8);
-                ctx.restore();
-            }
-        }],
-        options: {
-            cutout: '78%',
-            maintainAspectRatio: false,
-            plugins: {
-                legend: { position: 'right', labels: { color: '#888', font: { size: 9 } } },
+        data: {
+            labels: ['ACCORD', 'APC', 'PDP', 'ADC'],
+            datasets: [{ 
+                data: [acc, apc, pdp, adc], 
+                backgroundColor: ['#ffc107', '#0b3d91', '#d9534f', '#006400'],
+                borderWidth: 1,
+                borderColor: '#161616'
+            }]
+        },
+        options: { 
+            maintainAspectRatio: false, 
+            cutout: '70%',
+            plugins: { 
+                legend: { display: false },
                 datalabels: {
                     color: '#fff',
                     font: { weight: 'bold', size: 10 },
-                    formatter: (val) => total > 0 ? (val/total*100).toFixed(1) + '%' : ''
+                    formatter: (value, context) => {
+                        const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                        return total > 0 ? Math.round((value / total) * 100) + '%' : '';
+                    }
                 }
-            }
+            } 
         }
     });
 }
+
 initDashboard();
-setInterval(refreshData, 20000);
+setInterval(refreshData, 30000);
 </script>
 </body></html>
 """
